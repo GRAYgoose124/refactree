@@ -23,6 +23,28 @@ app = typer.Typer(
 console = Console(force_terminal=True)
 
 
+def find_project_root(start_path: Path) -> Path:
+    """Find the project root by looking for common markers like pyproject.toml, setup.py, or .git."""
+    current = start_path.resolve()
+    
+    # If start_path is a file, start from its parent
+    if current.is_file():
+        current = current.parent
+    
+    # Walk up the directory tree looking for project markers
+    markers = ["pyproject.toml", "setup.py", "setup.cfg", ".git"]
+    for _ in range(10):  # Limit search depth
+        for marker in markers:
+            if (current / marker).exists():
+                return current
+        if current.parent == current:  # Reached filesystem root
+            break
+        current = current.parent
+    
+    # If no marker found, return the original directory
+    return start_path.resolve() if start_path.is_dir() else start_path.resolve().parent
+
+
 def print_validation_result(result: ValidationResult) -> None:
     """Print validation results to console."""
     if result.success:
@@ -398,7 +420,16 @@ def split(
 ) -> None:
     """Split a large module into smaller ones."""
     module = module.resolve()
-    project_root = module.parent
+    
+    # Determine project root: find the actual project root by looking for markers
+    if module.is_dir():
+        # If a directory was passed, we need to find a specific module to split
+        console.print(f"[red]Error:[/red] split command expects a Python file, not a directory")
+        console.print(f"  Use: refactree split <path/to/module.py>")
+        raise typer.Exit(1)
+    
+    # Find the project root by looking for project markers
+    project_root = find_project_root(module)
 
     parser = ASTParser(project_root)
     symbols, dependencies = parser.parse_project()
