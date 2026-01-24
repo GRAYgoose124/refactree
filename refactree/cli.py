@@ -12,8 +12,9 @@ from rich import print as rprint
 
 from refactree.analyzer import ASTParser, DependencyGraph, CouplingMetrics
 from refactree.git import GitManager
-from refactree.refactor import RefactorPlanner, RefactorExecutor
+from refactree.refactor import RefactorPlanner, RefactorExecutor, RefactorStrategy
 from refactree.validation import RuffValidator, MypyValidator, ValidationResult
+from refactree.preferences import load_preferences
 
 app = typer.Typer(
     name="refactree",
@@ -189,6 +190,28 @@ def refactor(
         "-a",
         help="Automatically apply suggested refactorings",
     ),
+    strategy: Optional[str] = typer.Option(
+        None,
+        "--strategy",
+        help="Refactoring strategy: minimize-coupling, maximize-cohesion, reduce-cycles, consolidate-modules, balanced, semantic-grouping, concept-based, hybrid, preference-weighted, split-large-modules",
+    ),
+    interactive: bool = typer.Option(
+        False,
+        "--interactive",
+        "-i",
+        help="Show multiple strategy options and let you choose",
+    ),
+    max_operations: int = typer.Option(
+        20,
+        "--max-operations",
+        help="Maximum number of operations per plan",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show detailed diagnostic information",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -230,25 +253,139 @@ def refactor(
         except ValueError as e:
             console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(1)
+    elif interactive:
+        # Interactive mode: show multiple strategies
+        console.print("[bold]Generating alternative refactoring plans...[/bold]\n")
+        
+        if verbose:
+            # Show diagnostic info
+            project_metrics = metrics.calculate_project_metrics()
+            console.print(f"[dim]Project stats: {project_metrics.total_symbols} symbols, {project_metrics.total_modules} modules[/dim]")
+            console.print(f"[dim]Cycles: {project_metrics.cycles_count}, Avg coupling: {project_metrics.avg_coupling:.2f}[/dim]\n")
+            
+            # Check what suggest_moves returns
+            test_suggestions = metrics.suggest_moves(max_suggestions=10)
+            console.print(f"[dim]Base suggestions found: {len(test_suggestions)}[/dim]")
+            if test_suggestions:
+                console.print("[dim]Sample suggestions:[/dim]")
+                for qname, target, score in test_suggestions[:3]:
+                    console.print(f"  [dim]• {qname} -> {target.name} (score: {score:.1%})[/dim]")
+            console.print()
+        
+        alternative_plans = planner.generate_alternative_plans(max_operations_per_plan=max_operations)
+        
+        if not alternative_plans:
+            console.print("[yellow]No refactoring suggestions found with current thresholds.[/yellow]")
+            console.print("\n[dim]This could mean:[/dim]")
+            console.print("  • Your code is well-organized (great!)")
+            console.print("  • Symbols don't have strong coupling to other modules")
+            console.print("  • All suggested moves would create import cycles")
+            console.print("\n[dim]Try:[/dim]")
+            console.print("  • Use [cyan]--max-operations[/cyan] to see more suggestions")
+            console.print("  • Use [cyan]--verbose[/cyan] to see diagnostic information")
+            console.print("  • Check specific modules with [cyan]analyze --suggest[/cyan]")
+            console.print("  • Manually specify moves with [cyan]--symbol[/cyan] and [cyan]--target[/cyan]")
+            raise typer.Exit(0)
+        
+        # Display all plans
+        console.print("[bold]Available Refactoring Strategies:[/bold]\n")
+        strategy_list = list(alternative_plans.keys())
+        for i, (strat, alt_plan) in enumerate(alternative_plans.items(), 1):
+            console.print(f"[cyan]{i}.[/cyan] [bold]{strat.value}[/bold] - {len(alt_plan.operations)} operations")
+            # Show first few operations as preview
+            for op in alt_plan.operations[:3]:
+                console.print(f"     - {op.symbol.name}: {op.source_module.name} -> {op.target_module.name}")
+            if len(alt_plan.operations) > 3:
+                console.print(f"     ... and {len(alt_plan.operations) - 3} more")
+            console.print()
+        
+        # Let user choose
+        try:
+            choice = typer.prompt(
+                f"Select strategy (1-{len(strategy_list)}) or 'all' to see details",
+                default="1",
+            )
+            
+            if choice.lower() == "all":
+                # Show all plans in detail
+                for strat, alt_plan in alternative_plans.items():
+                    console.print(f"\n[bold cyan]{'='*60}[/bold cyan]")
+                    console.print(f"[bold]Strategy: {strat.value}[/bold] ({len(alt_plan.operations)} operations)\n")
+                    for op in alt_plan.operations:
+                        console.print(f"  Move [cyan]{op.symbol.name}[/cyan]: {op.source_module.name} -> {op.target_module.name}")
+                        console.print(f"    Reason: {op.reason}")
+                    console.print()
+                
+                choice = typer.prompt(
+                    f"Select strategy to apply (1-{len(strategy_list)})",
+                    type=int,
+                )
+            
+            selected_strategy = strategy_list[int(choice) - 1]
+            plan = alternative_plans[selected_strategy]
+            console.print(f"\n[bold]Selected strategy: {selected_strategy.value}[/bold]\n")
+            
+            # Offer enhanced interactive mode
+            if typer.confirm("\n[cyan]Enter enhanced interactive mode?[/cyan]", default=False):
+                from refactree.interactive import InteractiveRefactorSession
+                session = InteractiveRefactorSession(symbols, plan, selected_strategy)
+                try:
+                    plan = session.run()
+                except KeyboardInterrupt:
+                    console.print("\n[yellow]Interactive session cancelled.[/yellow]")
+                    raise typer.Exit(0)
+        except (ValueError, IndexError, KeyboardInterrupt):
+            console.print("\n[yellow]Cancelled.[/yellow]")
+            raise typer.Exit(0)
     elif auto:
-        # Automatic refactoring
-        plan = planner.plan_auto_organize()
+        # Automatic refactoring with optional strategy
+        strategy_enum = None
+        if strategy:
+            try:
+                strategy_enum = RefactorStrategy(strategy)
+            except ValueError:
+                console.print(f"[red]Error:[/red] Unknown strategy '{strategy}'")
+                console.print("Available strategies: minimize-coupling, maximize-cohesion, reduce-cycles, consolidate-modules, balanced")
+                raise typer.Exit(1)
+        else:
+            strategy_enum = RefactorStrategy.BALANCED
+        
+        plan = planner.plan_auto_organize(strategy=strategy_enum, max_operations=max_operations)
         if not plan.operations:
             console.print("[green]No refactoring needed - code is well organized![/green]")
             raise typer.Exit(0)
-        console.print(f"[bold]Auto-generated plan with {len(plan.operations)} operations:[/bold]\n")
+        console.print(f"[bold]Auto-generated plan ({strategy_enum.value}) with {len(plan.operations)} operations:[/bold]\n")
     else:
-        console.print("[red]Error:[/red] Specify either --symbol/--target or --auto")
+        console.print("[red]Error:[/red] Specify either --symbol/--target, --auto, or --interactive")
         raise typer.Exit(1)
 
     # Show plan
-    for op in plan.operations:
-        console.print(f"  Move [cyan]{op.symbol.name}[/cyan]: {op.source_module.name} -> {op.target_module.name}")
-        console.print(f"    Reason: {op.reason}")
+    console.print("[bold]Refactoring Plan:[/bold]\n")
+    for i, op in enumerate(plan.operations, 1):
+        console.print(f"  {i}. Move [cyan]{op.symbol.name}[/cyan]: {op.source_module.name} -> {op.target_module.name}")
+        console.print(f"     Reason: {op.reason}")
 
     if dry_run:
         console.print("\n[yellow]Dry run - no changes made[/yellow]")
         raise typer.Exit(0)
+
+    # Allow selective application
+    if interactive or typer.confirm("\nSelect specific operations to apply?", default=False):
+        console.print("\n[bold]Select operations to apply (comma-separated numbers, or 'all'):[/bold]")
+        selection = typer.prompt("Operations", default="all")
+        
+        if selection.lower() != "all":
+            try:
+                indices = [int(x.strip()) - 1 for x in selection.split(",")]
+                selected_ops = [plan.operations[i] for i in indices if 0 <= i < len(plan.operations)]
+                if selected_ops:
+                    plan.operations = selected_ops
+                    console.print(f"\n[green]Selected {len(selected_ops)} operations to apply[/green]\n")
+                else:
+                    console.print("[yellow]No valid operations selected, cancelling[/yellow]")
+                    raise typer.Exit(0)
+            except (ValueError, IndexError):
+                console.print("[red]Invalid selection, applying all operations[/red]")
 
     # Confirm
     if not typer.confirm("\nProceed with refactoring?"):
@@ -471,6 +608,60 @@ def split(
     executor = RefactorExecutor(project_root, on_progress=lambda msg: console.print(f"[dim]{msg}[/dim]"))
     modified_files = executor.execute(plan)
     console.print(f"\n[green][OK][/green] Created {len(by_target)} new modules")
+
+
+@app.command()
+def setup_nltk() -> None:
+    """Download required NLTK data for semantic analysis."""
+    console.print("[bold]Setting up NLTK data for semantic analysis...[/bold]\n")
+    
+    try:
+        import nltk
+        from refactree.semantic.nlp_utils import _ensure_nltk_data
+        
+        if _ensure_nltk_data:
+            console.print("[dim]Downloading NLTK data (this may take a few minutes)...[/dim]")
+            try:
+                _ensure_nltk_data()
+                console.print("[green][OK][/green] NLTK data downloaded successfully!")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Some data may not have downloaded: {e}[/yellow]")
+                console.print("[dim]Trying manual download...[/dim]")
+        else:
+            console.print("[dim]Manual download mode...[/dim]")
+        
+        # Manual download as backup
+        required_data = [
+            ("punkt_tab", "tokenizers/punkt_tab"),
+            ("punkt", "tokenizers/punkt"),  # Fallback
+            ("stopwords", "corpora/stopwords"),
+            ("wordnet", "corpora/wordnet"),
+            ("averaged_perceptron_tagger", "taggers/averaged_perceptron_tagger"),
+            ("omw-1.4", "corpora/omw-1.4"),
+        ]
+        
+        for data_name, data_path in required_data:
+            try:
+                # Check if already exists
+                nltk.data.find(data_path)
+                console.print(f"[green][OK][/green] {data_name} already available")
+            except LookupError:
+                try:
+                    console.print(f"[dim]Downloading {data_name}...[/dim]")
+                    nltk.download(data_name, quiet=False)
+                    console.print(f"[green][OK][/green] {data_name} downloaded")
+                except Exception as e:
+                    console.print(f"[yellow][WARN][/yellow] Could not download {data_name}: {e}")
+        
+        console.print("\n[green][OK][/green] NLTK setup complete!")
+        console.print("[dim]You can now use semantic analysis strategies.[/dim]")
+            
+    except ImportError:
+        console.print("[red]Error:[/red] NLTK is not installed. Install it with: uv add nltk")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] Failed to setup NLTK: {e}")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

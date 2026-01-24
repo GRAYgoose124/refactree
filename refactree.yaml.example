@@ -1,0 +1,82 @@
+# Example Refactree Configuration File
+# Copy this to refactree.yaml or .refactree.yaml in your project root
+
+preferences:
+  # Semantic analysis configuration
+  semantic:
+    enabled: true                    # Enable semantic analysis
+    weight: 0.4                      # Weight in hybrid mode (0.0-1.0)
+    similarity_threshold: 0.6         # Minimum similarity for grouping (0.0-1.0)
+    use_docstrings: true             # Analyze docstrings for semantic info
+    use_comments: false              # Analyze comments (future feature)
+
+  # Custom organizational rules
+  # Rules are applied in priority order (higher priority first)
+  rules:
+    - name: "API endpoints"
+      pattern: "*Endpoint"            # Glob pattern: matches UserEndpoint, ApiEndpoint, etc.
+      target_module: "api/endpoints.py"
+      priority: 10
+
+    - name: "Database models"
+      pattern: "*Model"              # Matches UserModel, ProductModel, etc.
+      target_module: "models/"
+      priority: 9
+
+    - name: "Serializers"
+      pattern: "*Serializer"
+      target_module: "serializers/"
+      priority: 8
+
+    - name: "Validators"
+      pattern: "*Validator"
+      target_module: "validation/"
+      priority: 7
+
+  # Semantic tags for keyword-based organization
+  # Symbols matching keywords will be suggested for the target module
+  tags:
+    - name: "authentication"
+      keywords:
+        - "auth"
+        - "login"
+        - "logout"
+        - "token"
+        - "session"
+        - "password"
+        - "credential"
+      target_module: "auth/"
+
+    - name: "utilities"
+      keywords:
+        - "util"
+        - "helper"
+        - "common"
+        - "shared"
+      target_module: "utils/"
+
+    - name: "database"
+      keywords:
+        - "db"
+        - "database"
+        - "query"
+        - "connection"
+        - "migration"
+      target_module: "db/"
+
+    - name: "http"
+      keywords:
+        - "http"
+        - "request"
+        - "response"
+        - "api"
+        - "endpoint"
+        - "route"
+      target_module: "http/"
+
+  # Strategy weights (optional)
+  # Adjust how much each strategy type contributes in hybrid mode
+  strategy_weights:
+    structural: 0.6
+    semantic: 0.4
+
