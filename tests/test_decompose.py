@@ -165,3 +165,73 @@ def test_real_world_monoliths(tmp_path: Path, module: str, run: bool) -> None:
         run_args=[] if run and plan.main_units else None,
     )
     assert report.ok, report
+
+
+# --- class splitting ---------------------------------------------------------------------
+
+
+def _big_class_source() -> str:
+    parts = ["class Base:", "    def ping(self):", "        return 'base'", ""]
+    parts += ["class Big(Base):", '    """A god class."""', "    kind = 'big'", ""]
+    parts += ["    def __init__(self):", "        self.rows = []", "        self.cols = []"]
+    parts += ["        self.__secret = 1", ""]
+    for i in range(12):
+        parts += [f"    def row_op{i}(self, x):", f"        self.rows.append(x + {i})"]
+        parts += ["        return len(self.rows)", ""]
+    for i in range(12):
+        parts += [f"    def col_op{i}(self, x):", f"        self.cols.append(x * {i})"]
+        parts += ["        return sum(self.cols)", ""]
+    parts += ["    def peek(self):", "        return self.__secret", ""]
+    parts += ["    def ping(self):", "        return 'big:' + super().ping()", ""]
+    parts += ["    def pong(self):", "        return super().ping()", ""]
+    parts += ["    alias = row_op0", ""]
+    return "\n".join(parts) + "\n"
+
+
+def test_class_split_preserves_behaviour_and_pins_unsafe_methods() -> None:
+    from refactree.decompose.classsplit import split_classes
+
+    src = _big_class_source()
+    new, report = split_classes(src, max_lines=40, min_mixin_lines=20)
+    assert len(report) == 1 and len(report[0].mixins) >= 2
+    moved = {m for ms in report[0].mixins.values() for m in ms}
+    assert "__init__" not in moved  # dunder
+    assert "peek" not in moved  # name-mangled access
+    assert "ping" not in moved  # reached via super()
+    assert "row_op0" not in moved  # referenced in class body
+    rows = {m for m in moved if m.startswith("row")}
+    cols = {m for m in moved if m.startswith("col")}
+    assert rows and cols
+    assert not any(rows & set(ms) and cols & set(ms) for ms in report[0].mixins.values())
+
+    old_ns: dict[str, object] = {}
+    new_ns: dict[str, object] = {}
+    exec(compile(src, "old", "exec"), old_ns)
+    exec(compile(new, "new", "exec"), new_ns)
+    for ns in (old_ns, new_ns):
+        b = ns["Big"]()  # type: ignore[operator]
+        ns["out"] = (b.row_op3(1), b.col_op2(5), b.peek(), b.ping(), b.pong(), b.alias(0))
+    assert old_ns["out"] == new_ns["out"]
+
+
+# --- naming ------------------------------------------------------------------------------
+
+
+def test_exception_families_are_named_errors() -> None:
+    src = "\n".join(
+        [f"class E{i}Error(ValueError):\n    pass\n" for i in range(4)]
+        + [f"def work{i}(x):\n    return x + {i}\n" for i in range(12)]
+        + ["def boom():\n    raise E0Error(E1Error(E2Error(E3Error())))\n"]
+    )
+    plan = build_plan(src, ClusterConfig(min_lines=5))
+    assert plan.module_of("E0Error") in ("errors", "exceptions")
+
+
+# --- benchmark ---------------------------------------------------------------------------
+
+
+def test_benchmark_recovers_json_package_structure() -> None:
+    from refactree.decompose.bench import flatten, score
+
+    s = score(flatten("json"))
+    assert s.ari > 0.6, s

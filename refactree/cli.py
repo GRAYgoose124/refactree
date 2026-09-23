@@ -637,6 +637,11 @@ def decompose(
         help="Also run original and package with these args (shell-split) and compare stdout/rc",
     ),
     check: bool = typer.Option(True, "--check/--no-check", help="Import + lint the result"),
+    split_classes: bool = typer.Option(
+        True,
+        "--split-classes/--no-split-classes",
+        help="Split classes longer than --max-lines into behaviour-preserving mixins",
+    ),
     shim: bool = typer.Option(
         False, "--shim", help="Replace the script with a thin shim that delegates to the package"
     ),
@@ -663,8 +668,15 @@ def decompose(
         max_lines=max_lines,
         interface_penalty=interface_penalty,
         extract_constants=constants,
+        split_classes=split_classes,
     )
     plan = build_plan(script.read_text(), cfg)
+    for cs in plan.class_splits:
+        console.print(f"[bold]class {cs.cls}[/bold] split into mixins:")
+        for mixin, methods in cs.mixins.items():
+            console.print(f"  {mixin}: {', '.join(methods)}")
+        if cs.pinned:
+            console.print(f"  [dim]kept in {cs.cls}: {', '.join(cs.pinned)}[/dim]")
 
     table = Table(title=f"{script.name} -> {pkg}/")
     table.add_column("module", style="green")
@@ -687,8 +699,8 @@ def decompose(
     for m in plan.modules:
         if m.lines > max_lines:
             console.print(
-                f"[yellow]note:[/yellow] {m.name} is {m.lines} lines; its core cannot be split "
-                "without changing code (e.g. one very large class)"
+                f"[yellow]note:[/yellow] {m.name} is {m.lines} lines; its core could not be "
+                "split further without changing semantics"
             )
 
     if dry_run:

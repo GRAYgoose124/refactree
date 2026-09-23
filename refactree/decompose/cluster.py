@@ -18,8 +18,11 @@ class ClusterConfig:
     min_lines: int = -1  # -1: auto (scales with file size)
     max_lines: int = 400
     extract_constants: bool = True
+    split_classes: bool = True  # split classes longer than max_lines into mixins
     interface_penalty: float = 1.0  # λ: cost of each name crossing a module boundary
     refine_sweeps: int = 8
+    # Louvain resolutions used as independent starting points (empty: just `resolution`)
+    init_resolutions: tuple[float, ...] = (0.75, 1.0, 1.5, 2.0, 3.0)
     seed: int = 0
 
 
@@ -73,7 +76,9 @@ def repair_cycles(ug: UnitGraph, parts: Partition) -> Partition:
             return parts
         where = {g: k for k, p in enumerate(parts) for g in p}
         cg = _cluster_digraph(ug, parts)
-        sccs = [scc for scc in nx.strongly_connected_components(cg) if len(scc) > 1]
+        sccs = sorted(
+            (scc for scc in nx.strongly_connected_components(cg) if len(scc) > 1), key=min
+        )
         in_scc = {k: i for i, scc in enumerate(sccs) for k in scc}
         movers = {
             x
@@ -86,12 +91,12 @@ def repair_cycles(ug: UnitGraph, parts: Partition) -> Partition:
             parts = pushed
             continue
         best: tuple[tuple[int, int], float, Partition] | None = None
-        for g in movers:
+        for g in sorted(movers):
             src = where[g]
             if len(parts[src]) == 1:
                 continue
             stay = _affinity_to(ug, g, parts[src])
-            for t in [*sccs[in_scc[src]], -1]:
+            for t in [*sorted(sccs[in_scc[src]]), -1]:
                 if t == src:
                     continue
                 trial = [set(p) for p in parts]
@@ -129,7 +134,7 @@ def _push_down(
             ka, kb = where[a], where[b]
             if ka != kb and ka in scc and kb in scc:
                 cross.setdefault((ka, kb), set()).add(b)
-        for (src, dst), targets in cross.items():
+        for (src, dst), targets in sorted(cross.items()):
             # src uses `targets` living in dst: move them (and what they need in dst) into src
             closure = set(targets)
             stack = list(targets)
@@ -335,7 +340,7 @@ def refine(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition:
             base_iface = _iface(parts, terms)
             neighbours = {where[h] for h in aff[g]} | {where[h] for h in ug.deps[g]}
             best: tuple[float, int] | None = None
-            for b in neighbours - {a}:
+            for b in sorted(neighbours - {a}):
                 if _lines(ug, parts[b]) + ug.group_lines[g] > cfg.max_lines:
                     continue
                 dq = (k_to[b] - k_to[a]) / (m2 / 2) - cfg.resolution * deg[g] * (
@@ -369,7 +374,7 @@ def merge_pass(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition
             if where[a] != where[b]
         }
         best: tuple[float, Partition] | None = None
-        for i, j in pairs:
+        for i, j in sorted(pairs):
             if _lines(ug, parts[i]) + _lines(ug, parts[j]) > cfg.max_lines:
                 continue
             trial = [p for k, p in enumerate(parts) if k not in (i, j)] + [parts[i] | parts[j]]
@@ -382,12 +387,21 @@ def merge_pass(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition
     return parts
 
 
-def partition(ug: UnitGraph, cfg: ClusterConfig) -> tuple[Partition, float]:
-    g = ug.affinity
-    if g.number_of_nodes() == 0:
-        return [], 0.0
+def local_search(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition:
+    """Alternate single-group moves and whole-cluster merges until neither improves."""
+    best = objective(ug, parts, cfg)
+    for _ in range(6):
+        parts = merge_pass(ug, refine(ug, parts, cfg), cfg)
+        cur = objective(ug, parts, cfg)
+        if cur <= best + 1e-9:
+            break
+        best = cur
+    return parts
+
+
+def _pipeline(ug: UnitGraph, cfg: ClusterConfig, init_resolution: float) -> Partition:
     parts: Partition = [
-        set(c) for c in louvain_communities(g, "weight", cfg.resolution, seed=cfg.seed)
+        set(c) for c in louvain_communities(ug.affinity, "weight", init_resolution, seed=cfg.seed)
     ]
     frozen: set[frozenset[int]] = set()
     parts = repair_cycles(ug, parts)
@@ -398,10 +412,25 @@ def partition(ug: UnitGraph, cfg: ClusterConfig) -> tuple[Partition, float]:
             break
     parts = refine(ug, parts, cfg)
     parts = merge_small(ug, parts, cfg)
-    parts = merge_pass(ug, parts, cfg)
-    parts = refine(ug, parts, cfg)
+    parts = local_search(ug, parts, cfg)
     if cfg.extract_constants and len(parts) > 1:
         parts = repair_cycles(ug, extract_constants(ug, parts, cfg.min_lines))
-    parts = refine(ug, parts, cfg) if len(parts) > 1 else parts
+        parts = refine(ug, parts, cfg) if len(parts) > 1 else parts
+    return parts
+
+
+def partition(ug: UnitGraph, cfg: ClusterConfig) -> tuple[Partition, float]:
+    g = ug.affinity
+    if g.number_of_nodes() == 0:
+        return [], 0.0
+    starts = cfg.init_resolutions or (cfg.resolution,)
+    best: tuple[float, Partition] | None = None
+    for r in starts:  # multi-start: keep the best objective, not the first local optimum
+        parts = _pipeline(ug, cfg, r)
+        score = objective(ug, parts, cfg)
+        if best is None or score > best[0] + 1e-12:
+            best = (score, parts)
+    assert best is not None
+    parts = best[1]
     q = modularity(g, parts, weight="weight") if g.number_of_edges() else 0.0
     return parts, q

@@ -56,16 +56,45 @@ How it works:
    direction's dependencies down, else merge), splitting of oversized modules, absorbing
    tiny ones, greedy refinement of *cohesion − λ·interface width*, and optional hoisting of
    widely shared constants into `constants.py`.
-5. **Emission** — modules in dependency order, only the imports each one uses, sibling
+5. **Class decomposition** — classes longer than `--max-lines` are split into mixins by
+   clustering methods on shared `self.` state, intra-class calls and vocabulary.
+   `class Big(_BigParseMixin, _BigHelpMixin, Base)` keeps the MRO and zero-arg `super()`
+   semantics intact; dunders, name-mangled access, `__class__`, methods reached through
+   `super()` or referenced in the class body stay in the core class, and Enum / NamedTuple
+   / TypedDict / Protocol / metaclass / `__slots__` classes are left alone.
+6. **Emission** — modules in dependency order, only the imports each one uses, sibling
    imports as `from .x import ...`, annotation-only ones under `if TYPE_CHECKING:`,
-   `__init__.py` re-exporting the original public API, `__main__.py` for the main guard.
+   `__init__.py` re-exporting the original API (private names and `_`-aliased imports
+   included, so `mock.patch("pkg._sys.exit")`-style code keeps working), `__main__.py`
+   for the main guard.
    Comments and formatting of the original code are preserved verbatim.
-6. **Verification** — import the package, check every public name is still exported,
+7. **Verification** — import the package, check every public name is still exported,
    ruff for *new* undefined/unused/redefined names (diffed against the original), and
    optionally byte-compare stdout + exit code of original vs package.
 
+Module names follow conventions (`cli`, `constants`, `errors`), then the author's section
+banners, then the module's anchor class, then its most distinctive vocabulary (TF-IDF
+against sibling modules, pluralized for families such as `actions`).
+
+Clustering runs several independent starts (Louvain at different resolutions, each followed
+by constrained local search) and keeps the best objective. As a sanity check, the
+decomposed CPython `argparse` (4 giant classes split into mixins, 8 modules) passes
+CPython's own `test_argparse` suite exactly like the original: 1845 tests, same results.
+
+#### Benchmark
+
+`python -m refactree.decompose.bench [--shuffle] [packages...]` flattens real
+multi-module packages (json, email, http, unittest, click, yaml, ...) into single-file
+monoliths, decomposes them, and scores agreement with the authors' original modules
+(ARI / NMI). `--shuffle` randomizes statement order so source locality can't help. Use it
+to evaluate any change to the weights or the optimizer.
+
+Limitation: code that monkeypatches module globals of the original (e.g.
+`mock.patch("script.helper")`) only affects the re-export in the package, not internal
+references in the submodule that defines them.
+
 Knobs: `--resolution` (higher → more, smaller modules), `--interface-penalty` (λ),
-`--min-lines` / `--max-lines`, `--no-constants`.
+`--min-lines` / `--max-lines`, `--no-constants`, `--no-split-classes`.
 
 ### `analyze` — Inspect project structure and dependencies
 

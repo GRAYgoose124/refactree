@@ -7,6 +7,7 @@ import builtins
 import math
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import networkx as nx
@@ -37,7 +38,10 @@ class Weights:
     reference: float = 1.0  # u uses a name defined by v
     inheritance: float = 3.0  # base class / decorator
     shared_import: float = 0.5  # both use the same external import (idf weighted)
-    shared_token: float = 0.3  # identifiers share a domain token (idf weighted)
+    shared_token: float = 0.0  # (legacy) identifiers share a domain token (idf weighted)
+    lexical: float = 1.0  # TF-IDF cosine similarity of vocabularies (kNN graph)
+    lexical_k: int = 6  # neighbours per group in the lexical kNN graph
+    lexical_min: float = 0.1  # ignore similarities below this
     locality: float = 0.15  # adjacent in the original file
     section: float = 0.4  # under the same banner comment in the original file
     shared_base: float = 1.0  # sibling classes deriving from the same local base
@@ -277,11 +281,57 @@ def build_graph(
         w.section,
     )
 
+    _lexical_edges(units, groups, w, bump)
+
     order = sorted(range(len(groups)), key=lambda g: groups[g][0])
     for ga, gb in zip(order, order[1:], strict=False):
         bump(ga, gb, w.locality)
 
+    # canonical insertion order: community detection is sensitive to it
+    aff = _canonical(aff)
+    deps = _canonical(deps)
     return UnitGraph(
         units, groups, group_of, definer, dict(external), typing_external,
         deps, aff, g_lines, g_ext, lazy, deleted, unresolved,
     )  # fmt: skip
+
+
+def _lexical_edges(
+    units: list[Unit], groups: list[list[int]], w: Weights, bump: Callable[[int, int, float], None]
+) -> None:
+    """Conceptual cohesion: groups talking about the same things belong together."""
+    if w.lexical <= 0 or len(groups) < 3:
+        return
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    docs = [[t for i in g for t in units[i].vocab] for g in groups]
+    if not any(docs):
+        return
+    vec = TfidfVectorizer(analyzer=lambda d: d, sublinear_tf=True, min_df=1, max_df=0.5)
+    try:
+        x = vec.fit_transform(docs)
+    except ValueError:  # empty vocabulary after max_df pruning
+        return
+    sim = (x @ x.T).toarray()
+    k = w.lexical_k
+    for a in range(len(groups)):
+        sim[a, a] = 0.0
+        nbrs = sim[a].argsort()[::-1][:k]
+        for b in nbrs:
+            s = float(sim[a, b])
+            if s < w.lexical_min:
+                break
+            if a < b or a not in sim[b].argsort()[::-1][:k]:  # add each mutual pair once
+                bump(a, int(b), w.lexical * s)
+
+
+def _canonical[G: (nx.Graph[int], nx.DiGraph[int])](g: G) -> G:
+    out = g.__class__()
+    for n in sorted(g.nodes):
+        out.add_node(n, **g.nodes[n])
+    for a, b in sorted(g.edges):
+        attrs = dict(g.edges[a, b])
+        if "weight" in attrs:  # float sums depend on accumulation order
+            attrs["weight"] = round(attrs["weight"], 9)
+        out.add_edge(a, b, **attrs)
+    return out

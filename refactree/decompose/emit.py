@@ -111,7 +111,7 @@ def _body(head: str, units: list[Unit], idxs: list[int]) -> str:
     return head + sep + code
 
 
-def render(plan: DecompositionPlan, package: str) -> dict[str, str]:
+def render(plan: DecompositionPlan, package: str, export_private: bool = True) -> dict[str, str]:
     """Return {relative_path: source} for the generated package."""
     units = plan.units
     files: dict[str, str] = {}
@@ -138,6 +138,21 @@ def render(plan: DecompositionPlan, package: str) -> dict[str, str]:
             reexports.append(_from_import(f".{m.name}", set(pub)))
             exported += pub
     sections.append(reexports)
+    if export_private:
+        private = [
+            _from_import(f".{m.name}", priv) + "  # noqa: F401"
+            for m in plan.modules
+            if (priv := {n for n in m.defines - plan.graph.deleted if n.startswith("_")})
+        ]
+        # `import sys as _sys` style aliases are a common monkeypatching target
+        private_ext = {n for n in plan.graph.external if n.startswith("_")}
+        private += [
+            r + "  # noqa: F401"
+            for u in units
+            if u.kind == UnitKind.IMPORT and (r := _render_import(u, private_ext))
+        ]
+        if private:
+            sections.append(["# private names stay importable from the package", *private])
     if "__all__" not in dunder_names and exported:
         body = "".join(f"    {n!r},\n" for n in sorted(exported))
         sections.append([f"__all__ = [\n{body}]"])

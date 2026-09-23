@@ -38,6 +38,7 @@ class Unit:
     rebinds: set[str] = field(default_factory=set)  # AugAssign / attribute / subscript targets
     ann_uses: set[str] = field(default_factory=set)  # names referenced *only* in annotations
     comment_tokens: list[str] = field(default_factory=list)  # words from the leading comment
+    vocab: list[str] = field(default_factory=list)  # lexical tokens (identifiers, docs, comments)
     section: str = ""  # most recent banner comment ("# ---- storage ----") above this unit
 
     @property
@@ -373,6 +374,55 @@ def _is_typing_block(node: ast.stmt) -> bool:
     )
 
 
+_ENGLISH_STOP = frozenset(  # noqa: SIM905
+    """the a an and or of to in on for with by is are be as at this that it its from not no
+    if else when then than into out can will may should must do does done has have had was
+    were been being which who whom what where how all any each other such only own same so
+    too very just but also more most some none true false return returns self cls args
+    kwargs arg kwarg param params""".split()  # noqa: SIM905
+)
+_WORD = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+
+
+def _norm_token(t: str) -> str | None:
+    t = t.lower()
+    if len(t) < 3 or t in _ENGLISH_STOP:
+        return None
+    if t.endswith("ies") and len(t) > 4:
+        return t[:-3] + "y"
+    if t.endswith("s") and not t.endswith("ss") and len(t) > 3:
+        return t[:-1]
+    return t
+
+
+def _split_ident(name: str) -> list[str]:
+    parts = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    parts = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", parts)
+    return [p for p in parts.split("_") if p]
+
+
+def _vocabulary(node: ast.AST, src_lines: list[str]) -> list[str]:
+    """Bag of lexical tokens: identifiers (split), attribute names, docstrings, comments."""
+    raw: list[str] = []
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            raw += _split_ident(n.id)
+        elif isinstance(n, ast.Attribute):
+            raw += _split_ident(n.attr)
+        elif isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            raw += _split_ident(n.name) * 2  # own names count double
+            doc = ast.get_docstring(n)
+            if doc:
+                raw += _WORD.findall(doc)
+        elif isinstance(n, ast.arg | ast.keyword) and n.arg is not None:
+            raw += _split_ident(n.arg)
+    for ln in src_lines:
+        i = ln.find("#")
+        if i >= 0 and ln[:i].count('"') % 2 == 0 and ln[:i].count("'") % 2 == 0:
+            raw += _WORD.findall(ln[i + 1 :])
+    return [t for r in raw if (t := _norm_token(r))]
+
+
 def has_lazy_annotations(units: list[Unit]) -> bool:
     return any(
         u.kind == UnitKind.FUTURE and any(a.name == "annotations" for a in u.node.names)  # type: ignore[attr-defined]
@@ -417,6 +467,7 @@ def extract_units(source: str) -> tuple[list[Unit], str | None]:
             kind = UnitKind.ASSIGN  # refined below
         u = Unit(len(units), kind, node, start, end, text)
         u.section = section
+        u.vocab = _vocabulary(node, lines[start - 1 : end])
         u.comment_tokens = [
             w.lower()
             for ln in lines[start - 1 : node.lineno - 1]
