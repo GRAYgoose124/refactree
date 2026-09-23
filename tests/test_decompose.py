@@ -10,7 +10,7 @@ from pathlib import Path
 import networkx as nx
 import pytest
 
-from refactree.decompose import ClusterConfig, build_plan, render, verify, write
+from refactree.decompose import ClusterConfig, Weights, build_plan, render, verify, write
 from refactree.decompose.units import extract_units
 
 FIXTURE = Path(__file__).parent / "fixtures" / "shop_monolith.py"
@@ -235,3 +235,53 @@ def test_benchmark_recovers_json_package_structure() -> None:
 
     s = score(flatten("json"))
     assert s.ari > 0.6, s
+
+
+# --- change coupling -----------------------------------------------------------------------
+
+
+def test_git_cochange_pulls_together_code_edited_together(tmp_path: Path) -> None:
+    import subprocess
+
+    from refactree.decompose.history import blame_commits
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+
+    # two clusters by structure; `audit` and `ledger` share nothing but their history
+    base = {
+        f"alpha{i}": f"def alpha{i}(x):\n    return alpha_core(x) + {i}\n" for i in range(6)
+    } | {f"beta{i}": f"def beta{i}(x):\n    return beta_core(x) * {i}\n" for i in range(6)}
+    base["alpha_core"] = "def alpha_core(x):\n    return x + 1\n"
+    base["beta_core"] = "def beta_core(x):\n    return x * 2\n"
+    base["audit"] = "def audit(x):\n    return alpha_core(x)\n"
+    base["ledger"] = "def ledger(x):\n    return beta_core(x)\n"
+    order = ["alpha_core", *[f"alpha{i}" for i in range(6)], "audit", "beta_core"]
+    order += [f"beta{i}" for i in range(6)] + ["ledger"]
+    f = tmp_path / "mono.py"
+
+    def write() -> None:
+        f.write_text("\n\n".join(base[k] for k in order))
+
+    git("init", "-q")
+    write()
+    git("add", ".")
+    git("commit", "-qm", "init")
+    for rev in range(4):  # audit and ledger always change in the same commits
+        base["audit"] = f"def audit(x):\n    return alpha_core(x) - {rev}\n"
+        base["ledger"] = f"def ledger(x):\n    return beta_core(x) - {rev}\n"
+        write()
+        git("commit", "-qam", f"rev {rev}")
+
+    commits = blame_commits(f)
+    assert commits is not None and len(commits) == len(f.read_text().splitlines())
+    cfg = ClusterConfig(min_lines=1, max_lines=400, init_resolutions=())
+    without = build_plan(f.read_text(), cfg)
+    with_hist = build_plan(f.read_text(), cfg, Weights(cochange=6.0), line_commits=commits)
+    assert without.module_of("audit") != without.module_of("ledger")
+    assert with_hist.module_of("audit") == with_hist.module_of("ledger")

@@ -9,6 +9,7 @@ import re
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import networkx as nx
 
@@ -45,6 +46,7 @@ class Weights:
     locality: float = 0.15  # adjacent in the original file
     section: float = 0.4  # under the same banner comment in the original file
     shared_base: float = 1.0  # sibling classes deriving from the same local base
+    cochange: float = 1.0  # lines last changed by the same commit (git blame; idf weighted)
     annotation: float = 0.5  # multiplier for annotation-only references
     hub_fanout: int = 4  # references from groups touching more modules than this are damped
 
@@ -67,6 +69,7 @@ class UnitGraph:
     # subset of `deps` needed while the module is imported (cycles here are fatal);
     # the rest are only needed when some function runs and tolerate deferred imports
     eager: nx.DiGraph[int] = field(default_factory=nx.DiGraph)
+    cache: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def group_label(self, g: int) -> str:
         return " + ".join(self.units[i].label for i in self.groups[g])
@@ -92,7 +95,10 @@ class _UF:
 
 
 def build_graph(
-    units: list[Unit], weights: Weights | None = None, lazy_annotations: bool | None = None
+    units: list[Unit],
+    weights: Weights | None = None,
+    lazy_annotations: bool | None = None,
+    line_commits: list[str | None] | None = None,
 ) -> UnitGraph:
     w = weights or Weights()
     import_names = {
@@ -270,6 +276,19 @@ def build_graph(
                     bump(gs[a_i], gs[b_i], s)
 
     idf_pairs(g_ext, w.shared_import)
+    if line_commits:
+        idf_pairs(
+            {
+                g: {
+                    c
+                    for i in m
+                    for c in line_commits[units[i].start - 1 : units[i].end]
+                    if c is not None
+                }
+                for g, m in enumerate(groups)
+            },
+            w.cochange,
+        )
     idf_pairs(g_tokens, w.shared_token)
     idf_pairs(
         {

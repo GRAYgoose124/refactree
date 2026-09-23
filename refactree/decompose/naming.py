@@ -139,9 +139,7 @@ def name_modules(ug: UnitGraph, parts: list[set[int]], avoid: set[str]) -> dict[
     for k in sorted(range(n), key=lambda k: -lines(k)):  # big modules choose first
         clean = [re.sub(r"\W", "_", c).strip("_") or "core" for c in cands[k]]
         ok = [
-            c
-            for c in clean
-            if c not in _RESERVED and c not in avoid and not keyword.iskeyword(c)
+            c for c in clean if c not in _RESERVED and c not in avoid and not keyword.iskeyword(c)
         ]
         pool = ok + [f"{c}_ops" for c in clean if c not in ok]
         cand = next((c for c in pool if c not in taken), "")

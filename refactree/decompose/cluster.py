@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from typing import Any
 
 import networkx as nx
+import numpy as np
 from networkx.algorithms.community import louvain_communities, modularity
 
 from refactree.decompose.graph import UnitGraph
@@ -345,11 +347,68 @@ def _objective_terms(ug: UnitGraph) -> list[tuple[int, str, int]]:
     return out
 
 
+class _Scorer:
+    """Vectorised objective: modularity + interface width in O(E) numpy per evaluation."""
+
+    def __init__(self, ug: UnitGraph) -> None:
+        n = len(ug.groups)
+        edges = [(a, b, d["weight"]) for a, b, d in ug.affinity.edges(data=True) if a != b]
+        self.eu = np.array([e[0] for e in edges], dtype=np.int64)
+        self.ev = np.array([e[1] for e in edges], dtype=np.int64)
+        self.ew = np.array([e[2] for e in edges], dtype=np.float64)
+        self.m = float(self.ew.sum())
+        self.deg = np.bincount(
+            np.concatenate([self.eu, self.ev]), np.concatenate([self.ew, self.ew]), minlength=n
+        )
+        terms = _objective_terms(ug)
+        names = {nm: k for k, nm in enumerate(sorted({t[1] for t in terms}))}
+        self.tg = np.array([t[0] for t in terms], dtype=np.int64)
+        self.tn = np.array([names[t[1]] for t in terms], dtype=np.int64)
+        self.th = np.array([t[2] for t in terms], dtype=np.int64)
+        self.n_terms = max(1, len(terms))
+        self.n_names = max(1, len(names))
+        self.n = n
+
+    def labels(self, parts: Partition) -> np.ndarray[Any, np.dtype[np.int64]]:
+        lab = np.zeros(self.n, dtype=np.int64)
+        for k, p in enumerate(parts):
+            lab[list(p)] = k
+        return lab
+
+    def modularity(self, lab: np.ndarray[Any, np.dtype[np.int64]], gamma: float) -> float:
+        if self.m == 0:
+            return 0.0
+        k = int(lab.max()) + 1 if lab.size else 1
+        same = lab[self.eu] == lab[self.ev]
+        inside = np.bincount(lab[self.eu][same], self.ew[same], minlength=k)
+        dsum = np.bincount(lab, self.deg, minlength=k)
+        return float((inside / self.m - gamma * (dsum / (2 * self.m)) ** 2).sum())
+
+    def iface(self, lab: np.ndarray[Any, np.dtype[np.int64]]) -> int:
+        cross = lab[self.tg] != lab[self.th]
+        if not cross.any():
+            return 0
+        keys = lab[self.tg][cross] * self.n_names + self.tn[cross]
+        return int(np.unique(keys).size)
+
+    def score(self, lab: np.ndarray[Any, np.dtype[np.int64]], cfg: ClusterConfig) -> float:
+        return (
+            self.modularity(lab, cfg.resolution)
+            - cfg.interface_penalty * self.iface(lab) / self.n_terms
+        )
+
+
+def _scorer(ug: UnitGraph) -> _Scorer:
+    sc = ug.cache.get("scorer")
+    if sc is None:
+        sc = ug.cache["scorer"] = _Scorer(ug)
+    return sc
+
+
 def objective(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> float:
     """Cohesion (resolution-scaled modularity) minus normalized interface width."""
-    q = modularity(ug.affinity, parts, weight="weight", resolution=cfg.resolution)
-    terms = _objective_terms(ug)
-    return q - cfg.interface_penalty * _iface(parts, terms) / max(1, len(terms))
+    sc = _scorer(ug)
+    return sc.score(sc.labels(parts), cfg)
 
 
 def _iface(parts: Partition, terms: list[tuple[int, str, int]]) -> int:
@@ -364,8 +423,8 @@ def refine(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition:
     m2 = 2.0 * aff.size(weight="weight")
     if m2 == 0:
         return parts
-    terms = _objective_terms(ug)
-    norm = cfg.interface_penalty / max(1, len(terms))
+    sc = _scorer(ug)
+    norm = cfg.interface_penalty / sc.n_terms
     deg = dict(aff.degree(weight="weight"))
     parts = [set(p) for p in parts]
     for _ in range(cfg.refine_sweeps):
@@ -380,29 +439,29 @@ def refine(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition:
             for h, d in aff[g].items():
                 if h != g:
                     k_to[where[h]] += d["weight"]
-            base_iface = _iface(parts, terms)
+            lab = sc.labels(parts)
+            base_iface = sc.iface(lab)
             neighbours = {where[h] for h in aff[g]} | {where[h] for h in ug.deps[g]}
-            best: tuple[float, int] | None = None
+            cands: list[tuple[float, int]] = []
             for b in sorted(neighbours - {a}):
                 if _lines(ug, parts[b]) + ug.group_lines[g] > cfg.max_lines:
                     continue
                 dq = (k_to[b] - k_to[a]) / (m2 / 2) - cfg.resolution * deg[g] * (
                     tot[b] - (tot[a] - deg[g])
                 ) / (m2 * m2 / 2)
+                lab[g] = b
+                delta = dq - norm * (sc.iface(lab) - base_iface)
+                lab[g] = a
+                if delta > 1e-9:
+                    cands.append((delta, b))
+            for _delta, b in sorted(cands, key=lambda c: (-c[0], c[1])):
                 trial = [set(p) for p in parts]
                 trial[a].discard(g)
                 trial[b].add(g)
-                delta = dq - norm * (_iface(trial, terms) - base_iface)
-                if (
-                    delta > 1e-9
-                    and (best is None or delta > best[0])
-                    and _is_acyclic(ug, trial, parts)
-                ):
-                    best = (delta, b)
-            if best is not None:
-                parts[a].discard(g)
-                parts[best[1]].add(g)
-                improved = True
+                if _is_acyclic(ug, trial, parts):
+                    parts = trial
+                    improved = True
+                    break
         parts = [p for p in parts if p]
         if not improved:
             break
@@ -411,26 +470,33 @@ def refine(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition:
 
 def merge_pass(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition:
     """Greedily merge whole clusters while that improves the objective."""
+    sc = _scorer(ug)
     parts = [set(p) for p in parts]
     while len(parts) > 1:
-        base = objective(ug, parts, cfg)
-        where = {g: k for k, p in enumerate(parts) for g in p}
+        lab = sc.labels(parts)
+        base = sc.score(lab, cfg)
         pairs = {
-            (min(where[a], where[b]), max(where[a], where[b]))
-            for a, b in ug.affinity.edges
-            if where[a] != where[b]
+            (min(x, y), max(x, y))
+            for x, y in zip(lab[sc.eu].tolist(), lab[sc.ev].tolist(), strict=True)
+            if x != y
         }
-        best: tuple[float, Partition] | None = None
+        cands: list[tuple[float, int, int]] = []
         for i, j in sorted(pairs):
             if _lines(ug, parts[i]) + _lines(ug, parts[j]) > cfg.max_lines:
                 continue
+            trial_lab = np.where(lab == j, i, lab)
+            gain = sc.score(trial_lab, cfg) - base
+            if gain > 1e-9:
+                cands.append((gain, i, j))
+        merged = False
+        for _gain, i, j in sorted(cands, key=lambda c: (-c[0], c[1], c[2])):
             trial = [p for k, p in enumerate(parts) if k not in (i, j)] + [parts[i] | parts[j]]
-            gain = objective(ug, trial, cfg) - base
-            if gain > 1e-9 and (best is None or gain > best[0]) and _is_acyclic(ug, trial, parts):
-                best = (gain, trial)
-        if best is None:
+            if _is_acyclic(ug, trial, parts):
+                parts = trial
+                merged = True
+                break
+        if not merged:
             return parts
-        parts = best[1]
     return parts
 
 

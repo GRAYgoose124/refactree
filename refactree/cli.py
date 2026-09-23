@@ -637,6 +637,9 @@ def decompose(
         help="Also run original and package with these args (shell-split) and compare stdout/rc",
     ),
     check: bool = typer.Option(True, "--check/--no-check", help="Import + lint the result"),
+    history: bool = typer.Option(
+        True, "--history/--no-history", help="Use git co-change (git blame) as a signal"
+    ),
     split_classes: bool = typer.Option(
         True,
         "--split-classes/--no-split-classes",
@@ -670,7 +673,13 @@ def decompose(
         extract_constants=constants,
         split_classes=split_classes,
     )
-    plan = build_plan(script.read_text(), cfg)
+    from refactree.decompose.history import blame_commits
+
+    commits = blame_commits(script) if history else None
+    if commits is not None:
+        n_commits = len({c for c in commits if c})
+        console.print(f"[dim]git history: {n_commits} commits touch this file[/dim]")
+    plan = build_plan(script.read_text(), cfg, line_commits=commits)
     for cs in plan.class_splits:
         console.print(f"[bold]class {cs.cls}[/bold] split into mixins:")
         for mixin, methods in cs.mixins.items():

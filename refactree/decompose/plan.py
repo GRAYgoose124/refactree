@@ -9,6 +9,7 @@ import networkx as nx
 from refactree.decompose.classsplit import ClassSplit, split_classes
 from refactree.decompose.cluster import ClusterConfig, partition
 from refactree.decompose.graph import UnitGraph, Weights, build_graph
+from refactree.decompose.history import remap
 from refactree.decompose.naming import name_modules
 from refactree.decompose.units import Unit, UnitKind, extract_units
 
@@ -63,17 +64,25 @@ class DecompositionPlan:
 
 
 def build_plan(
-    source: str, cfg: ClusterConfig | None = None, weights: Weights | None = None
+    source: str,
+    cfg: ClusterConfig | None = None,
+    weights: Weights | None = None,
+    line_commits: list[str | None] | None = None,
 ) -> DecompositionPlan:
+    """Plan a decomposition. `line_commits` (commit id per source line, e.g. from
+    history.blame_commits) adds change-coupling as a signal."""
     cfg = cfg or ClusterConfig()
     splits: list[ClassSplit] = []
     if cfg.split_classes:
+        original = source
         source, splits = split_classes(source, cfg.max_lines)
+        if line_commits is not None and source != original:
+            line_commits = remap(original, line_commits, source)
     units, doc = extract_units(source)
     if cfg.min_lines < 0:  # auto: scale with the file
         code_lines = sum(u.lines for u in units if u.kind in (UnitKind.DEF, UnitKind.ASSIGN))
         cfg.min_lines = max(10, min(40, code_lines // 25))
-    ug = build_graph(units, weights)
+    ug = build_graph(units, weights, line_commits=line_commits)
     parts, q = partition(ug, cfg)
 
     # order modules so dependencies come first
