@@ -50,8 +50,10 @@ How it works:
    with its consumers.
 3. **Affinity graph** — weighted by references (damped for hubs and widely used
    utilities), inheritance/decorators, sibling subclasses, shared external imports and
-   identifier vocabulary (IDF-weighted), the author's section-banner comments, and source
-   locality.
+   identifier vocabulary (IDF-weighted), TF-IDF conceptual cohesion over identifiers,
+   docstrings and comments, the author's section-banner comments, source locality, and —
+   when the script is in git — change coupling from `git blame` (code edited in the same
+   commits). All local; no network.
 4. **Clustering** — Louvain communities, then: import-cycle repair (push the minority
    direction's dependencies down, else merge), splitting of oversized modules, absorbing
    tiny ones, greedy refinement of *cohesion − λ·interface width*, and optional hoisting of
@@ -93,8 +95,25 @@ Limitation: code that monkeypatches module globals of the original (e.g.
 `mock.patch("script.helper")`) only affects the re-export in the package, not internal
 references in the submodule that defines them.
 
+#### Import-time vs deferred dependencies
+
+References inside function bodies only matter when the function runs, unless the function
+is invoked while the module is imported (module-level calls, decorators, instantiation);
+everything reachable from those counts as import-time. Modules are kept fully acyclic when
+possible. Where that would force a merge past `--max-lines`, cycles made only of deferred
+references are allowed: those names are imported under `TYPE_CHECKING` (so tools see them)
+and bound late by the package `__init__` once every module is loaded. Import-time cycles are
+never allowed.
+
+#### Tuning
+
+`python -m refactree.decompose.tune` fits the signal weights and optimizer knobs by
+coordinate descent on half the benchmark corpus and reports the other half. The shipped
+defaults came from this (held-out ARI 0.40 → 0.44; overall ordered/shuffled ARI
+0.424/0.405 → 0.461/0.460).
+
 Knobs: `--resolution` (higher → more, smaller modules), `--interface-penalty` (λ),
-`--min-lines` / `--max-lines`, `--no-constants`, `--no-split-classes`.
+`--min-lines` / `--max-lines`, `--no-constants`, `--no-split-classes`, `--no-history`.
 
 ### `analyze` — Inspect project structure and dependencies
 
