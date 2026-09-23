@@ -37,6 +37,9 @@ class Unit:
     globals_written: set[str] = field(default_factory=set)  # `global x` rebinding
     rebinds: set[str] = field(default_factory=set)  # AugAssign / attribute / subscript targets
     ann_uses: set[str] = field(default_factory=set)  # names referenced *only* in annotations
+    eager_uses: set[str] = field(default_factory=set)  # needed while importing the module
+    eager_ann_uses: set[str] = field(default_factory=set)  # annotations evaluated at def time
+    eager_calls: set[str] = field(default_factory=set)  # invoked while importing the module
     comment_tokens: list[str] = field(default_factory=list)  # words from the leading comment
     vocab: list[str] = field(default_factory=list)  # lexical tokens (identifiers, docs, comments)
     section: str = ""  # most recent banner comment ("# ---- storage ----") above this unit
@@ -152,6 +155,10 @@ class _Collector(ast.NodeVisitor):
         self.ann_loads: set[str] = set()
         self.runtime: set[str] = set()
         self.in_ann = 0
+        self.deferred = 0  # >0 inside function/lambda bodies: runs later, not at import
+        self.eager: set[str] = set()  # referenced while the module is being imported
+        self.eager_ann: set[str] = set()
+        self.eager_calls: set[str] = set()  # called (or applied as decorator) at import
         # (is_class_scope, local names)
         self.scopes: list[tuple[bool, set[str]]] = []
 
@@ -172,9 +179,29 @@ class _Collector(ast.NodeVisitor):
             return
         if self.in_ann:
             self.ann_loads.add(name)
+            if not self.deferred:
+                self.eager_ann.add(name)  # evaluated at def time unless annotations are lazy
         else:
             self.runtime.add(name)
+            if not self.deferred:
+                self.eager.add(name)
         self.loads[name] += 1
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if (
+            not self.deferred
+            and not self.in_ann
+            and isinstance(node.func, ast.Name)
+            and self._is_module_ref(node.func.id)
+        ):
+            self.eager_calls.add(node.func.id)
+        self.generic_visit(node)
+
+    def _decorators(self, decos: list[ast.expr]) -> None:
+        for deco in decos:
+            if not self.deferred and isinstance(deco, ast.Name) and self._is_module_ref(deco.id):
+                self.eager_calls.add(deco.id)
+            self.visit(deco)
 
     # ---- scopes ------------------------------------------------------------
     def _push_type_params(self, node: ast.AST) -> bool:
@@ -192,8 +219,7 @@ class _Collector(ast.NodeVisitor):
         return True
 
     def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        for deco in node.decorator_list:
-            self.visit(deco)
+        self._decorators(node.decorator_list)
         for d in [*node.args.defaults, *node.args.kw_defaults]:
             if d is not None:
                 self.visit(d)
@@ -203,8 +229,10 @@ class _Collector(ast.NodeVisitor):
         self._annotations(node.args, node.returns)
         local, _ = _scope_bindings(node.body)
         self.scopes.append((False, local | _arg_names(node.args)))
+        self.deferred += 1
         for st in node.body:
             self.visit(st)
+        self.deferred -= 1
         self.scopes.pop()
         if tp:
             self.scopes.pop()
@@ -212,8 +240,7 @@ class _Collector(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        for e in node.decorator_list:
-            self.visit(e)
+        self._decorators(node.decorator_list)
         if self.depth == 0:
             self.stores.add(node.name)
         tp = self._push_type_params(node)
@@ -245,7 +272,9 @@ class _Collector(ast.NodeVisitor):
             if d is not None:
                 self.visit(d)
         self.scopes.append((False, _arg_names(node.args)))
+        self.deferred += 1
         self.visit(node.body)
+        self.deferred -= 1
         self.scopes.pop()
 
     def _comp(self, node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp) -> None:
@@ -484,6 +513,9 @@ def extract_units(source: str) -> tuple[list[Unit], str | None]:
             }
             u.rebinds = c.rebinds - c.stores
             u.ann_uses = c.ann_loads - c.runtime
+            u.eager_uses = c.eager
+            u.eager_ann_uses = c.eager_ann
+            u.eager_calls = c.eager_calls
             if isinstance(node, ast.ClassDef):
                 u.base_uses = {
                     n.id

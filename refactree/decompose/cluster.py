@@ -29,11 +29,13 @@ class ClusterConfig:
 Partition = list[set[int]]
 
 
-def _cluster_digraph(ug: UnitGraph, parts: Partition) -> nx.DiGraph[int]:
+def _cluster_digraph(
+    ug: UnitGraph, parts: Partition, graph: nx.DiGraph[int] | None = None
+) -> nx.DiGraph[int]:
     where = {g: k for k, p in enumerate(parts) for g in p}
     cg: nx.DiGraph[int] = nx.DiGraph()
     cg.add_nodes_from(range(len(parts)))
-    for a, b in ug.deps.edges:
+    for a, b in (ug.eager if graph is None else graph).edges:
         if where[a] != where[b]:
             cg.add_edge(where[a], where[b])
     return cg
@@ -43,10 +45,13 @@ def _lines(ug: UnitGraph, part: set[int]) -> int:
     return sum(ug.group_lines[g] for g in part)
 
 
-def _cycle_badness(ug: UnitGraph, parts: Partition) -> tuple[int, int]:
+def _cycle_badness(
+    ug: UnitGraph, parts: Partition, graph: nx.DiGraph[int] | None = None
+) -> tuple[int, int]:
     """(#clusters caught in cycles, #dependency edges inside those cycles)."""
+    graph = ug.eager if graph is None else graph
     where = {g: k for k, p in enumerate(parts) for g in p}
-    cg = _cluster_digraph(ug, parts)
+    cg = _cluster_digraph(ug, parts, graph)
     comp: dict[int, int] = {}
     n_clusters = 0
     for ci, scc in enumerate(nx.strongly_connected_components(cg)):
@@ -56,7 +61,7 @@ def _cycle_badness(ug: UnitGraph, parts: Partition) -> tuple[int, int]:
                 comp[k] = ci
     edges = sum(
         1
-        for a, b in ug.deps.edges
+        for a, b in graph.edges
         if where[a] != where[b] and where[a] in comp and comp[where[a]] == comp.get(where[b])
     )
     return n_clusters, edges
@@ -66,27 +71,40 @@ def _affinity_to(ug: UnitGraph, g: int, part: set[int]) -> float:
     return float(sum(d["weight"] for h, d in ug.affinity[g].items() if h in part and h != g))
 
 
-def repair_cycles(ug: UnitGraph, parts: Partition) -> Partition:
-    """Break import cycles by relocating single groups, choosing the move that loses the
-    least affinity; fall back to merging when no single move helps."""
+def repair_cycles(ug: UnitGraph, parts: Partition, max_lines: int | None = None) -> Partition:
+    """Make the module graph acyclic.
+
+    Pass 1 targets *all* runtime dependencies (the way people lay out packages) but only
+    merges modules when the result stays within max_lines; deferred-only cycles that remain
+    are tolerated (bound late by the package __init__). Pass 2 then guarantees that the
+    import-time graph is acyclic, merging if it must.
+    """
+    if max_lines is not None:
+        parts = _repair(ug, parts, ug.deps, max_lines)
+    return _repair(ug, parts, ug.eager, None)
+
+
+def _repair(
+    ug: UnitGraph, parts: Partition, graph: nx.DiGraph[int], max_merge: int | None
+) -> Partition:
     parts = [set(p) for p in parts if p]
     while True:
-        bad = _cycle_badness(ug, parts)
+        bad = _cycle_badness(ug, parts, graph)
         if bad == (0, 0):
             return parts
         where = {g: k for k, p in enumerate(parts) for g in p}
-        cg = _cluster_digraph(ug, parts)
+        cg = _cluster_digraph(ug, parts, graph)
         sccs = sorted(
             (scc for scc in nx.strongly_connected_components(cg) if len(scc) > 1), key=min
         )
         in_scc = {k: i for i, scc in enumerate(sccs) for k in scc}
         movers = {
             x
-            for a, b in ug.deps.edges
+            for a, b in graph.edges
             if where[a] != where[b] and in_scc.get(where[a], -1) == in_scc.get(where[b], -2)
             for x in (a, b)
         }
-        pushed = _push_down(ug, parts, sccs, where, bad)
+        pushed = _push_down(ug, parts, sccs, where, bad, graph)
         if pushed is not None:
             parts = pushed
             continue
@@ -107,14 +125,20 @@ def repair_cycles(ug: UnitGraph, parts: Partition) -> Partition:
                 else:
                     trial[t].add(g)
                     gain = _affinity_to(ug, g, parts[t])
-                nb = _cycle_badness(ug, trial)
+                nb = _cycle_badness(ug, trial, graph)
                 if nb >= bad:
                     continue
                 cand = (nb, stay - gain, trial)
                 if best is None or (cand[1], cand[0]) < (best[1], best[0]):
                     best = cand
         if best is None:
-            return make_acyclic(ug, parts)
+            if max_merge is None:
+                return make_acyclic(ug, parts, graph)
+            merged = make_acyclic(ug, parts, graph, max_merge)
+            if len(merged) == len(parts):
+                return parts  # remaining cycles are too big to merge: tolerate them
+            parts = merged
+            continue
         parts = [p for p in best[2] if p]
 
 
@@ -124,13 +148,14 @@ def _push_down(
     sccs: list[set[int]],
     where: dict[int, int],
     bad: tuple[int, int],
+    graph: nx.DiGraph[int],
 ) -> Partition | None:
     """For clusters A, B in a cycle, move the targets of B->A edges (plus their dependency
     closure inside A) into B, or vice versa; take the cheapest option that reduces badness."""
     best: tuple[float, Partition] | None = None
     for scc in sccs:
         cross: dict[tuple[int, int], set[int]] = {}
-        for a, b in ug.deps.edges:
+        for a, b in graph.edges:
             ka, kb = where[a], where[b]
             if ka != kb and ka in scc and kb in scc:
                 cross.setdefault((ka, kb), set()).add(b)
@@ -140,7 +165,7 @@ def _push_down(
             stack = list(targets)
             while stack:
                 x = stack.pop()
-                for y in ug.deps.successors(x):
+                for y in graph.successors(x):
                     if where[y] == dst and y not in closure:
                         closure.add(y)
                         stack.append(y)
@@ -149,7 +174,7 @@ def _push_down(
             trial = [set(p) for p in parts]
             trial[dst] -= closure
             trial[src] |= closure
-            nb = _cycle_badness(ug, trial)
+            nb = _cycle_badness(ug, trial, graph)
             if nb >= bad:
                 continue
             cost = sum(_affinity_to(ug, g, parts[dst] - closure) for g in closure) - sum(
@@ -160,17 +185,31 @@ def _push_down(
     return [p for p in best[1] if p] if best else None
 
 
-def make_acyclic(ug: UnitGraph, parts: Partition) -> Partition:
-    """Merge clusters that participate in import cycles."""
-    cg = _cluster_digraph(ug, parts)
+def make_acyclic(
+    ug: UnitGraph,
+    parts: Partition,
+    graph: nx.DiGraph[int] | None = None,
+    max_lines: int | None = None,
+) -> Partition:
+    """Merge clusters that participate in cycles (only those that fit in max_lines)."""
+    cg = _cluster_digraph(ug, parts, graph)
     out: Partition = []
     for scc in nx.strongly_connected_components(cg):
-        out.append(set().union(*(parts[k] for k in scc)))
+        merged = set().union(*(parts[k] for k in scc))
+        if max_lines is not None and len(scc) > 1 and _lines(ug, merged) > max_lines:
+            out.extend(parts[k] for k in sorted(scc))
+        else:
+            out.append(merged)
     return out
 
 
-def _is_acyclic(ug: UnitGraph, parts: Partition) -> bool:
-    return nx.is_directed_acyclic_graph(_cluster_digraph(ug, parts))
+def _is_acyclic(ug: UnitGraph, parts: Partition, ref: Partition | None = None) -> bool:
+    """Import-time graph acyclic and no more runtime-dependency cycles than `ref` has."""
+    if not nx.is_directed_acyclic_graph(_cluster_digraph(ug, parts)):
+        return False
+    if ref is None:
+        return nx.is_directed_acyclic_graph(_cluster_digraph(ug, parts, ug.deps))
+    return _cycle_badness(ug, parts, ug.deps) <= _cycle_badness(ug, ref, ug.deps)
 
 
 def split_oversized(
@@ -195,7 +234,11 @@ def split_oversized(
         # keep it above max_lines regardless) or improves the objective outright
         solves = max(_lines(ug, x) for x in pieces) <= max(cfg.max_lines, 0.8 * _lines(ug, p))
         helps = objective(ug, trial, cfg) > objective(ug, [*out, p, *parts[k + 1 :]], cfg)
-        if len(pieces) > 1 and (solves or helps) and _is_acyclic(ug, trial):
+        if (
+            len(pieces) > 1
+            and (solves or helps)
+            and _is_acyclic(ug, trial, [*out, p, *parts[k + 1 :]])
+        ):
             out.extend(pieces)
         else:
             frozen.add(frozenset(p))
@@ -241,7 +284,7 @@ def merge_small(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partitio
         )
         for j in hosts:
             trial = [q for i, q in enumerate(parts) if i not in (j, k)] + [parts[j] | p]
-            if _is_acyclic(ug, trial):
+            if _is_acyclic(ug, trial, parts):
                 parts = trial
                 merged = True
                 break
@@ -350,7 +393,11 @@ def refine(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition:
                 trial[a].discard(g)
                 trial[b].add(g)
                 delta = dq - norm * (_iface(trial, terms) - base_iface)
-                if delta > 1e-9 and (best is None or delta > best[0]) and _is_acyclic(ug, trial):
+                if (
+                    delta > 1e-9
+                    and (best is None or delta > best[0])
+                    and _is_acyclic(ug, trial, parts)
+                ):
                     best = (delta, b)
             if best is not None:
                 parts[a].discard(g)
@@ -379,7 +426,7 @@ def merge_pass(ug: UnitGraph, parts: Partition, cfg: ClusterConfig) -> Partition
                 continue
             trial = [p for k, p in enumerate(parts) if k not in (i, j)] + [parts[i] | parts[j]]
             gain = objective(ug, trial, cfg) - base
-            if gain > 1e-9 and (best is None or gain > best[0]) and _is_acyclic(ug, trial):
+            if gain > 1e-9 and (best is None or gain > best[0]) and _is_acyclic(ug, trial, parts):
                 best = (gain, trial)
         if best is None:
             return parts
@@ -404,17 +451,17 @@ def _pipeline(ug: UnitGraph, cfg: ClusterConfig, init_resolution: float) -> Part
         set(c) for c in louvain_communities(ug.affinity, "weight", init_resolution, seed=cfg.seed)
     ]
     frozen: set[frozenset[int]] = set()
-    parts = repair_cycles(ug, parts)
+    parts = repair_cycles(ug, parts, cfg.max_lines)
     for _ in range(6):
         before = sorted(map(sorted, parts))
-        parts = repair_cycles(ug, split_oversized(ug, parts, cfg, frozen))
+        parts = repair_cycles(ug, split_oversized(ug, parts, cfg, frozen), cfg.max_lines)
         if sorted(map(sorted, parts)) == before:
             break
     parts = refine(ug, parts, cfg)
     parts = merge_small(ug, parts, cfg)
     parts = local_search(ug, parts, cfg)
     if cfg.extract_constants and len(parts) > 1:
-        parts = repair_cycles(ug, extract_constants(ug, parts, cfg.min_lines))
+        parts = repair_cycles(ug, extract_constants(ug, parts, cfg.min_lines), cfg.max_lines)
         parts = refine(ug, parts, cfg) if len(parts) > 1 else parts
     return parts
 

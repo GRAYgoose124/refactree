@@ -64,6 +64,9 @@ class UnitGraph:
     lazy_annotations: bool = False
     deleted: set[str] = field(default_factory=set)  # `del`-ed at module level: not exported
     unresolved: set[str] = field(default_factory=set)  # injected dynamically (globals()[...])
+    # subset of `deps` needed while the module is imported (cycles here are fatal);
+    # the rest are only needed when some function runs and tolerate deferred imports
+    eager: nx.DiGraph[int] = field(default_factory=nx.DiGraph)
 
     def group_label(self, g: int) -> str:
         return " + ".join(self.units[i].label for i in self.groups[g])
@@ -290,9 +293,13 @@ def build_graph(
     # canonical insertion order: community detection is sensitive to it
     aff = _canonical(aff)
     deps = _canonical(deps)
+    if not lazy:
+        for u in units:
+            u.eager_uses |= u.eager_ann_uses
+    eager = _canonical(_eager_graph(units, groups, definer, deps))
     return UnitGraph(
         units, groups, group_of, definer, dict(external), typing_external,
-        deps, aff, g_lines, g_ext, lazy, deleted, unresolved,
+        deps, aff, g_lines, g_ext, lazy, deleted, unresolved, eager,
     )  # fmt: skip
 
 
@@ -335,3 +342,35 @@ def _canonical[G: (nx.Graph[int], nx.DiGraph[int])](g: G) -> G:
             attrs["weight"] = round(attrs["weight"], 9)
         out.add_edge(a, b, **attrs)
     return out
+
+
+def _eager_graph(
+    units: list[Unit],
+    groups: list[list[int]],
+    definer: dict[str, int],
+    deps: nx.DiGraph[int],
+) -> nx.DiGraph[int]:
+    """Dependencies exercised at import time.
+
+    A reference inside a function body only matters when the function runs - unless the
+    function (or class) is itself invoked while importing, in which case everything it
+    can reach runs at import too.
+    """
+    eager: nx.DiGraph[int] = nx.DiGraph()
+    eager.add_nodes_from(deps.nodes)
+    seeds: set[int] = set()
+    for g, members in enumerate(groups):
+        for i in members:
+            u = units[i]
+            for n in u.eager_uses - u.ann_uses:
+                h = definer.get(n)
+                if h is not None and h != g:
+                    eager.add_edge(g, h)
+            seeds |= {h for n in u.eager_calls if (h := definer.get(n)) is not None}
+    activated = set(seeds)
+    for sd in seeds:
+        activated |= nx.descendants(deps, sd)
+    for g in activated:
+        for h in deps.successors(g):
+            eager.add_edge(g, h)
+    return eager

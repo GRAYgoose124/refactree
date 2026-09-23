@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import copy
 import importlib
+import os
 import random
 import sys
 import time
@@ -247,7 +248,12 @@ DEFAULT_CORPUS = [
 ]  # fmt: skip
 
 
-_CACHE: dict[str, Monolith] = {}
+def _score_one(args: tuple[str, ClusterConfig | None, bool, Weights | None]) -> Score | str:
+    pkg, cfg, shuffle, weights = args
+    try:
+        return score(flatten(pkg), cfg, shuffle=shuffle, weights=weights)
+    except Exception as exc:  # noqa: BLE001
+        return f"{pkg}: {type(exc).__name__}: {exc}"
 
 
 def run(
@@ -256,20 +262,28 @@ def run(
     verbose: bool = True,
     shuffle: bool = False,
     weights: Weights | None = None,
+    jobs: int = 0,
 ) -> list[Score]:
-    scores = []
-    for p in pkgs:
-        try:
-            mono = _CACHE.get(p) or _CACHE.setdefault(p, flatten(p))
-        except Exception as exc:  # noqa: BLE001
-            print(f"{p:28} flatten failed: {exc}", file=sys.stderr)
+    """Score each package (in parallel processes; everything is local and deterministic)."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    work = [(p, cfg, shuffle, weights) for p in pkgs]
+    workers = jobs or min(len(work), os.cpu_count() or 1)
+    if workers > 1:
+        with ProcessPoolExecutor(workers) as ex:
+            results = list(ex.map(_score_one, work))
+    else:
+        results = [_score_one(w) for w in work]
+    scores: list[Score] = []
+    for r in results:
+        if isinstance(r, str):
+            print(f"flatten/score failed: {r}", file=sys.stderr)
             continue
-        s = score(mono, cfg, shuffle=shuffle, weights=weights)
-        scores.append(s)
+        scores.append(r)
         if verbose:
             print(
-                f"{s.name:28} {s.lines:6}L  truth={s.truth_modules:3} got={s.modules:3}  "
-                f"ARI={s.ari:.3f}  NMI={s.nmi:.3f}  iface={s.interface:4}  {s.seconds:.1f}s"
+                f"{r.name:28} {r.lines:6}L  truth={r.truth_modules:3} got={r.modules:3}  "
+                f"ARI={r.ari:.3f}  NMI={r.nmi:.3f}  iface={r.interface:4}  {r.seconds:.1f}s"
             )
     if scores and verbose:
         n = len(scores)

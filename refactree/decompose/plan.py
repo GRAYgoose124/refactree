@@ -21,6 +21,8 @@ class ModulePlan:
     defines: set[str]
     imports_from: dict[str, set[str]] = field(default_factory=dict)  # sibling -> names
     type_imports_from: dict[str, set[str]] = field(default_factory=dict)  # TYPE_CHECKING only
+    # names only needed when functions run, from modules imported later: bottom-of-file
+    deferred_imports_from: dict[str, set[str]] = field(default_factory=dict)
     cohesion: float = 0.0
 
 
@@ -38,8 +40,13 @@ class DecompositionPlan:
 
     @property
     def interface_width(self) -> int:
-        """Total number of names crossing module boundaries."""
-        return sum(len(ns) for m in self.modules for ns in m.imports_from.values())
+        """Total number of names crossing module boundaries (at runtime)."""
+        return sum(
+            len(ns)
+            for m in self.modules
+            for d in (m.imports_from, m.deferred_imports_from)
+            for ns in d.values()
+        )
 
     @property
     def exports(self) -> set[str]:
@@ -71,15 +78,28 @@ def build_plan(
 
     # order modules so dependencies come first
     where = {g: k for k, p in enumerate(parts) for g in p}
+    # import order must respect import-time edges; among the rest, follow all
+    # dependencies as far as their (possibly cyclic) structure allows
+    full: nx.DiGraph[int] = nx.DiGraph()
+    full.add_nodes_from(range(len(parts)))
     cg: nx.DiGraph[int] = nx.DiGraph()
     cg.add_nodes_from(range(len(parts)))
     for a, b in ug.deps.edges:
         if where[a] != where[b]:
-            cg.add_edge(where[b], where[a])  # b before a
-    order = list(nx.lexicographical_topological_sort(cg, key=lambda k: min(parts[k])))
+            full.add_edge(where[b], where[a])  # b before a
+    for a, b in ug.eager.edges:
+        if where[a] != where[b]:
+            cg.add_edge(where[b], where[a])
+    cond = nx.condensation(full)
+    rank = {
+        k: (pos, min(parts[k]))
+        for pos, c in enumerate(nx.lexicographical_topological_sort(cond, key=lambda c: c))
+        for k in cond.nodes[c]["members"]
+    }
+    order = list(nx.lexicographical_topological_sort(cg, key=lambda k: rank[k]))
 
     external = set(ug.external)
-    names = name_modules(ug, parts, external)
+    names = name_modules(ug, parts, external | set(ug.definer))
 
     modules: list[ModulePlan] = []
     for k in order:
@@ -101,14 +121,24 @@ def build_plan(
             )
         )
 
+    position = {m.name: k for k, m in enumerate(modules)}
     for m in modules:
         runtime = {n for i in m.units for n in units[i].runtime_uses}
         used = {n for i in m.units for n in units[i].uses}
+        mine = {ug.group_of[i] for i in m.units}
+        eager_targets = {h for g in mine for h in ug.eager.successors(g)}
         for n in used - m.defines:
             g = ug.definer.get(n)
-            if g is not None:
-                target = m.imports_from if n in runtime else m.type_imports_from
-                target.setdefault(names[where[g]], set()).add(n)
+            if g is None:
+                continue
+            src = names[where[g]]
+            if n not in runtime:
+                target = m.type_imports_from
+            elif g not in eager_targets and position[src] > position[m.name]:
+                target = m.deferred_imports_from
+            else:
+                target = m.imports_from
+            target.setdefault(src, set()).add(n)
 
     main_units = [u.idx for u in units if u.kind == UnitKind.MAIN]
     dunder_units = [u.idx for u in units if u.kind == UnitKind.DUNDER]

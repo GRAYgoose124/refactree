@@ -51,12 +51,14 @@ def _header(
     sibling_imports: dict[str, set[str]],
     dunder_imports: set[str],
     type_imports: dict[str, set[str]] | None = None,
+    deferred: dict[str, set[str]] | None = None,
 ) -> str:
     units = plan.units
     type_imports = {k: v for k, v in (type_imports or {}).items() if v}
+    deferred = {k: v for k, v in (deferred or {}).items() if v}
     used = {n for i in idxs for n in units[i].uses}
     typing_ext = used & plan.graph.typing_external
-    need_tc = bool(type_imports or typing_ext)
+    need_tc = bool(type_imports or typing_ext or deferred)
     have_tc = "TYPE_CHECKING" in plan.graph.external
     if need_tc and have_tc:
         used.add("TYPE_CHECKING")
@@ -86,6 +88,13 @@ def _header(
                         block.append(r)
         for mod, names in sorted(type_imports.items()):
             block.append(_from_import(f".{mod}", names))
+        if deferred:
+            block.append(
+                "# Only used inside functions; bound at runtime by the package __init__ once\n"
+                "# every module is loaded, which keeps the import graph acyclic."
+            )
+            for mod, names in sorted(deferred.items()):
+                block.append(_from_import(f".{mod}", names))
         out.append("if TYPE_CHECKING:")
         out += ["    " + ln for b in block for ln in b.splitlines()]
         out.append("")
@@ -121,8 +130,16 @@ def render(plan: DecompositionPlan, package: str, export_private: bool = True) -
 
     for m in plan.modules:
         used = {n for i in m.units for n in units[i].uses}
-        head = _header(plan, m.units, m.imports_from, used & dunder_names, m.type_imports_from)
-        files[f"{package}/{m.name}.py"] = _body(head, units, m.units)
+        head = _header(
+            plan,
+            m.units,
+            m.imports_from,
+            used & dunder_names,
+            m.type_imports_from,
+            m.deferred_imports_from,
+        )
+        text = _body(head, units, m.units)
+        files[f"{package}/{m.name}.py"] = text
 
     # __init__: docstring, dunders, re-exports of the original public surface
     sections: list[list[str]] = []
@@ -153,6 +170,26 @@ def render(plan: DecompositionPlan, package: str, export_private: bool = True) -
         ]
         if private:
             sections.append(["# private names stay importable from the package", *private])
+    wiring = [
+        (m.name, src, n)
+        for m in plan.modules
+        for src, ns in sorted(m.deferred_imports_from.items())
+        for n in sorted(ns)
+    ]
+    if wiring:
+        mods = sorted({x for a, b, _ in wiring for x in (a, b)})
+        lines = [
+            "# Late binding of names that modules use only inside functions (see the",
+            "# TYPE_CHECKING blocks there): all modules are fully loaded at this point.",
+            "from sys import modules as _loaded",
+            "",
+            "_m = {",
+            *(f"    {x!r}: _loaded[f'{{__name__}}.{x}']," for x in mods),
+            "}",
+        ]
+        lines += [f"_m[{a!r}].{n} = _m[{b!r}].{n}" for a, b, n in wiring]
+        lines.append("del _m, _loaded")
+        sections.append(lines)
     if "__all__" not in dunder_names and exported:
         body = "".join(f"    {n!r},\n" for n in sorted(exported))
         sections.append([f"__all__ = [\n{body}]"])
