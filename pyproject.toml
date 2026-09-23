@@ -48,3 +48,12 @@ warn_unused_ignores = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "types-networkx>=3.6.1.20260911",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"refactree/decompose/units.py" = ["N802", "N815"]  # ast.NodeVisitor naming

@@ -21,6 +21,52 @@ uv run python main.py <command> [options]
 
 ## Commands
 
+### `decompose` — Turn a monolithic script into a package
+
+The flagship operation: take one large file (say a 2000-line script) and split it into a
+package whose modules are cohesive, whose cross-module interfaces are as narrow as possible,
+and whose imports are acyclic. Behaviour is preserved and checked.
+
+```bash
+# Preview the plan (modules, cohesion, which names cross which boundary)
+uv run refactree decompose big_script.py --dry-run
+
+# Write big_script/ next to the file, verify it imports & lints, and compare runtime
+# behaviour of `python big_script.py ARGS` vs `python -m big_script ARGS`
+uv run refactree decompose big_script.py --run "--some --args"
+
+# Replace the script with a thin shim that delegates to the package
+uv run refactree decompose big_script.py --shim
+```
+
+How it works:
+
+1. **Units** — every top-level statement becomes a unit (def/class/assignment/side-effect).
+   Name resolution is scope-aware (locals, closures, comprehensions, class bodies, PEP 695
+   type params), and references used only in annotations are tracked separately.
+2. **Must-link constraints** — things that cannot be separated without changing semantics
+   stay together: redefinitions, `global` writers and the state they rebind, module-level
+   mutation (`REG[k] = ...`, `X += 1`), side-effect statements, and `globals()` injection
+   with its consumers.
+3. **Affinity graph** — weighted by references (damped for hubs and widely used
+   utilities), inheritance/decorators, sibling subclasses, shared external imports and
+   identifier vocabulary (IDF-weighted), the author's section-banner comments, and source
+   locality.
+4. **Clustering** — Louvain communities, then: import-cycle repair (push the minority
+   direction's dependencies down, else merge), splitting of oversized modules, absorbing
+   tiny ones, greedy refinement of *cohesion − λ·interface width*, and optional hoisting of
+   widely shared constants into `constants.py`.
+5. **Emission** — modules in dependency order, only the imports each one uses, sibling
+   imports as `from .x import ...`, annotation-only ones under `if TYPE_CHECKING:`,
+   `__init__.py` re-exporting the original public API, `__main__.py` for the main guard.
+   Comments and formatting of the original code are preserved verbatim.
+6. **Verification** — import the package, check every public name is still exported,
+   ruff for *new* undefined/unused/redefined names (diffed against the original), and
+   optionally byte-compare stdout + exit code of original vs package.
+
+Knobs: `--resolution` (higher → more, smaller modules), `--interface-penalty` (λ),
+`--min-lines` / `--max-lines`, `--no-constants`.
+
 ### `analyze` — Inspect project structure and dependencies
 
 Analyzes the project’s Python files and shows symbols, metrics, and optional refactoring suggestions.
