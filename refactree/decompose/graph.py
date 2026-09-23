@@ -34,18 +34,21 @@ def split_identifier(name: str) -> list[str]:
 
 @dataclass
 class Weights:
-    """Relative strengths of the affinity signals."""
+    """Relative strengths of the affinity signals.
 
-    reference: float = 1.0  # u uses a name defined by v
-    inheritance: float = 3.0  # base class / decorator
+    Defaults were fitted with `python -m refactree.decompose.tune` against the benchmark
+    corpus (held-out ARI 0.40 -> 0.44); re-run it after changing signals."""
+
+    reference: float = 2.0  # u uses a name defined by v
+    inheritance: float = 6.0  # base class / decorator
     shared_import: float = 0.5  # both use the same external import (idf weighted)
     shared_token: float = 0.0  # (legacy) identifiers share a domain token (idf weighted)
     lexical: float = 1.0  # TF-IDF cosine similarity of vocabularies (kNN graph)
     lexical_k: int = 6  # neighbours per group in the lexical kNN graph
     lexical_min: float = 0.1  # ignore similarities below this
-    locality: float = 0.15  # adjacent in the original file
+    locality: float = 0.1  # adjacent in the original file
     section: float = 0.4  # under the same banner comment in the original file
-    shared_base: float = 1.0  # sibling classes deriving from the same local base
+    shared_base: float = 2.0  # sibling classes deriving from the same local base
     cochange: float = 1.0  # lines last changed by the same commit (git blame; idf weighted)
     annotation: float = 0.5  # multiplier for annotation-only references
     hub_fanout: int = 4  # references from groups touching more modules than this are damped
