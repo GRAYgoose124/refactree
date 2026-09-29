@@ -21,6 +21,100 @@ uv run python main.py <command> [options]
 
 ## Commands
 
+### `decompose` — Turn a monolithic script into a package
+
+The flagship operation: take one large file (say a 2000-line script) and split it into a
+package whose modules are cohesive, whose cross-module interfaces are as narrow as possible,
+and whose imports are acyclic. Behaviour is preserved and checked.
+
+```bash
+# Preview the plan (modules, cohesion, which names cross which boundary)
+uv run refactree decompose big_script.py --dry-run
+
+# Write big_script/ next to the file, verify it imports & lints, and compare runtime
+# behaviour of `python big_script.py ARGS` vs `python -m big_script ARGS`
+uv run refactree decompose big_script.py --run "--some --args"
+
+# Replace the script with a thin shim that delegates to the package
+uv run refactree decompose big_script.py --shim
+```
+
+How it works:
+
+1. **Units** — every top-level statement becomes a unit (def/class/assignment/side-effect).
+   Name resolution is scope-aware (locals, closures, comprehensions, class bodies, PEP 695
+   type params), and references used only in annotations are tracked separately.
+2. **Must-link constraints** — things that cannot be separated without changing semantics
+   stay together: redefinitions, `global` writers and the state they rebind, module-level
+   mutation (`REG[k] = ...`, `X += 1`), side-effect statements, and `globals()` injection
+   with its consumers.
+3. **Affinity graph** — weighted by references (damped for hubs and widely used
+   utilities), inheritance/decorators, sibling subclasses, shared external imports and
+   identifier vocabulary (IDF-weighted), TF-IDF conceptual cohesion over identifiers,
+   docstrings and comments, the author's section-banner comments, source locality, and —
+   when the script is in git — change coupling from `git blame` (code edited in the same
+   commits). All local; no network.
+4. **Clustering** — Louvain communities, then: import-cycle repair (push the minority
+   direction's dependencies down, else merge), splitting of oversized modules, absorbing
+   tiny ones, greedy refinement of *cohesion − λ·interface width*, and optional hoisting of
+   widely shared constants into `constants.py`.
+5. **Class decomposition** — classes longer than `--max-lines` are split into mixins by
+   clustering methods on shared `self.` state, intra-class calls and vocabulary.
+   `class Big(_BigParseMixin, _BigHelpMixin, Base)` keeps the MRO and zero-arg `super()`
+   semantics intact; dunders, name-mangled access, `__class__`, methods reached through
+   `super()` or referenced in the class body stay in the core class, and Enum / NamedTuple
+   / TypedDict / Protocol / metaclass / `__slots__` classes are left alone.
+6. **Emission** — modules in dependency order, only the imports each one uses, sibling
+   imports as `from .x import ...`, annotation-only ones under `if TYPE_CHECKING:`,
+   `__init__.py` re-exporting the original API (private names and `_`-aliased imports
+   included, so `mock.patch("pkg._sys.exit")`-style code keeps working), `__main__.py`
+   for the main guard.
+   Comments and formatting of the original code are preserved verbatim.
+7. **Verification** — import the package, check every public name is still exported,
+   ruff for *new* undefined/unused/redefined names (diffed against the original), and
+   optionally byte-compare stdout + exit code of original vs package.
+
+Module names follow conventions (`cli`, `constants`, `errors`), then the author's section
+banners, then the module's anchor class, then its most distinctive vocabulary (TF-IDF
+against sibling modules, pluralized for families such as `actions`).
+
+Clustering runs several independent starts (Louvain at different resolutions, each followed
+by constrained local search) and keeps the best objective. As a sanity check, the
+decomposed CPython `argparse` (4 giant classes split into mixins, 8 modules) passes
+CPython's own `test_argparse` suite exactly like the original: 1845 tests, same results.
+
+#### Benchmark
+
+`python -m refactree.decompose.bench [--shuffle] [packages...]` flattens real
+multi-module packages (json, email, http, unittest, click, yaml, ...) into single-file
+monoliths, decomposes them, and scores agreement with the authors' original modules
+(ARI / NMI). `--shuffle` randomizes statement order so source locality can't help. Use it
+to evaluate any change to the weights or the optimizer.
+
+Limitation: code that monkeypatches module globals of the original (e.g.
+`mock.patch("script.helper")`) only affects the re-export in the package, not internal
+references in the submodule that defines them.
+
+#### Import-time vs deferred dependencies
+
+References inside function bodies only matter when the function runs, unless the function
+is invoked while the module is imported (module-level calls, decorators, instantiation);
+everything reachable from those counts as import-time. Modules are kept fully acyclic when
+possible. Where that would force a merge past `--max-lines`, cycles made only of deferred
+references are allowed: those names are imported under `TYPE_CHECKING` (so tools see them)
+and bound late by the package `__init__` once every module is loaded. Import-time cycles are
+never allowed.
+
+#### Tuning
+
+`python -m refactree.decompose.tune` fits the signal weights and optimizer knobs by
+coordinate descent on half the benchmark corpus and reports the other half. The shipped
+defaults came from this (held-out ARI 0.40 → 0.44; overall ordered/shuffled ARI
+0.424/0.405 → 0.461/0.460).
+
+Knobs: `--resolution` (higher → more, smaller modules), `--interface-penalty` (λ),
+`--min-lines` / `--max-lines`, `--no-constants`, `--no-split-classes`, `--no-history`.
+
 ### `analyze` — Inspect project structure and dependencies
 
 Analyzes the project’s Python files and shows symbols, metrics, and optional refactoring suggestions.

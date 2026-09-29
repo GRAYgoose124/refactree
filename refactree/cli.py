@@ -611,6 +611,155 @@ def split(
 
 
 @app.command()
+def decompose(
+    script: Path = typer.Argument(..., help="Monolithic Python file to decompose", exists=True),
+    out: Optional[Path] = typer.Option(
+        None, "--out", "-o", help="Directory to create the package in (default: next to script)"
+    ),
+    package: Optional[str] = typer.Option(
+        None, "--package", "-p", help="Package name (default: script name)"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show the plan only"),
+    resolution: float = typer.Option(
+        1.5, "--resolution", "-r", help="Higher = more, smaller modules"
+    ),
+    min_lines: int = typer.Option(-1, "--min-lines", help="Smallest module (-1: auto)"),
+    max_lines: int = typer.Option(400, "--max-lines", help="Soft cap on module size"),
+    interface_penalty: float = typer.Option(
+        1.0, "--interface-penalty", "-l", help="Cost of each name crossing a module boundary"
+    ),
+    constants: bool = typer.Option(
+        True, "--constants/--no-constants", help="Hoist widely shared constants into constants.py"
+    ),
+    run_args: Optional[str] = typer.Option(
+        None,
+        "--run",
+        help="Also run original and package with these args (shell-split) and compare stdout/rc",
+    ),
+    check: bool = typer.Option(True, "--check/--no-check", help="Import + lint the result"),
+    history: bool = typer.Option(
+        True, "--history/--no-history", help="Use git co-change (git blame) as a signal"
+    ),
+    split_classes: bool = typer.Option(
+        True,
+        "--split-classes/--no-split-classes",
+        help="Split classes longer than --max-lines into behaviour-preserving mixins",
+    ),
+    shim: bool = typer.Option(
+        False, "--shim", help="Replace the script with a thin shim that delegates to the package"
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing package dir"),
+) -> None:
+    """Decompose a monolithic script into a cohesive, loosely-coupled package.
+
+    Top-level statements are clustered on a weighted dependency graph (references,
+    inheritance, shared imports/vocabulary, source sections) to maximize cohesion while
+    minimizing the names that cross module boundaries. Module imports are kept acyclic;
+    annotation-only references become TYPE_CHECKING imports.
+    """
+    import shlex
+    import shutil
+
+    from refactree.decompose import ClusterConfig, build_plan, render, verify, write
+
+    script = script.resolve()
+    pkg = package or script.stem.replace("-", "_")
+    out_dir = (out or script.parent).resolve()
+    cfg = ClusterConfig(
+        resolution=resolution,
+        min_lines=min_lines,
+        max_lines=max_lines,
+        interface_penalty=interface_penalty,
+        extract_constants=constants,
+        split_classes=split_classes,
+    )
+    from refactree.decompose.history import blame_commits
+
+    commits = blame_commits(script) if history else None
+    if commits is not None:
+        n_commits = len({c for c in commits if c})
+        console.print(f"[dim]git history: {n_commits} commits touch this file[/dim]")
+    plan = build_plan(script.read_text(), cfg, line_commits=commits)
+    for cs in plan.class_splits:
+        console.print(f"[bold]class {cs.cls}[/bold] split into mixins:")
+        for mixin, methods in cs.mixins.items():
+            console.print(f"  {mixin}: {', '.join(methods)}")
+        if cs.pinned:
+            console.print(f"  [dim]kept in {cs.cls}: {', '.join(cs.pinned)}[/dim]")
+
+    table = Table(title=f"{script.name} -> {pkg}/")
+    table.add_column("module", style="green")
+    table.add_column("lines", justify="right")
+    table.add_column("cohesion", justify="right")
+    table.add_column("defines")
+    table.add_column("imports from siblings")
+    for m in plan.modules:
+        defs = sorted(m.defines - plan.graph.deleted)
+        shown = ", ".join(defs[:6]) + (f" (+{len(defs) - 6})" if len(defs) > 6 else "")
+        deps = ", ".join(
+            f"{k}({len(v)})" for k, v in sorted(m.imports_from.items())
+        ) + "".join(f" {k}[T]" for k in sorted(m.type_imports_from.keys() - m.imports_from.keys()))
+        table.add_row(m.name, str(m.lines), f"{m.cohesion:.2f}", shown, deps.strip() or "-")
+    console.print(table)
+    console.print(
+        f"modules={len(plan.modules)}  modularity={plan.modularity:.3f}  "
+        f"interface width={plan.interface_width} names  import cycles=0"
+    )
+    for m in plan.modules:
+        if m.lines > max_lines:
+            console.print(
+                f"[yellow]note:[/yellow] {m.name} is {m.lines} lines; its core could not be "
+                "split further without changing semantics"
+            )
+
+    if dry_run:
+        raise typer.Exit(0)
+
+    target = out_dir / pkg
+    if target.exists():
+        if not force:
+            console.print(f"[red]Error:[/red] {target} exists (use --force)")
+            raise typer.Exit(1)
+        shutil.rmtree(target)
+    files = render(plan, pkg)
+    write(files, out_dir)
+    console.print(f"[green][OK][/green] wrote {len(files)} files to {target}")
+
+    if check:
+        report = verify(
+            out_dir,
+            pkg,
+            plan.exports,
+            original=script,
+            run_args=shlex.split(run_args) if run_args is not None and plan.main_units else None,
+        )
+        console.print(
+            f"import: {'ok' if report.import_ok else '[red]FAILED[/red] ' + report.import_error}"
+        )
+        if report.missing_exports:
+            console.print(f"[red]missing exports:[/red] {', '.join(report.missing_exports)}")
+        for issue in report.lint_issues:
+            console.print(f"[red]lint:[/red] {issue}")
+        if report.run_match is not None:
+            console.print(
+                "behaviour: " + ("identical" if report.run_match else "[red]DIFFERS[/red]")
+            )
+            if not report.run_match:
+                console.print(report.run_diff)
+        if not report.ok:
+            raise typer.Exit(1)
+
+    if shim:
+        lines = [f'"""Compatibility shim: the implementation now lives in the `{pkg}` package."""']
+        lines.append(f"from {pkg} import *  # noqa: F401,F403")
+        if plan.main_units:
+            lines += ["", 'if __name__ == "__main__":', "    import runpy", "",
+                      f'    runpy.run_module("{pkg}", run_name="__main__")']
+        script.write_text("\n".join(lines) + "\n")
+        console.print(f"[green][OK][/green] replaced {script.name} with a shim")
+
+
+@app.command()
 def setup_nltk() -> None:
     """Download required NLTK data for semantic analysis."""
     console.print("[bold]Setting up NLTK data for semantic analysis...[/bold]\n")
